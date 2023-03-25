@@ -3,10 +3,13 @@
 Common modules
 """
 
+import ast
+import contextlib
 import json
 import math
 import platform
 import warnings
+import zipfile
 from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
@@ -118,6 +121,20 @@ class Bottleneck(nn.Module):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
+class BottleneckCBAM(nn.Module):
+    # bottleneck with CBAM
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.cbam = CBAM(c2, c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cbam(self.cv2(self.cv1(x))) if self.add else self.cv2(self.cv1(x))
+
+
 class BottleneckCSP(nn.Module):
     # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
@@ -162,7 +179,16 @@ class C3(nn.Module):
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
+        # print(self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1)).shape)
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+
+
+class C3CBAM(C3):
+    # C3 module with cross-convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(BottleneckCBAM(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
 
 class C3x(C3):
@@ -243,6 +269,50 @@ class Focus(nn.Module):
         # return self.conv(self.contract(x))
 
 
+# CBAM
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool= nn.AdaptiveAvgPool2d(1)
+        self.max_pool= nn.AdaptiveMaxPool2d(1)
+
+        self.fc1= nn.Conv2d(in_planes, in_planes//ratio, 1, bias=False)
+        self.relu1= nn.ReLU()
+        self.fc2= nn.Conv2d(in_planes//ratio, in_planes, 1, bias=False)
+        self.sigmoid= nn.Sigmoid()
+
+    def forward(self,x):
+        avg_out= self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out= self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out= avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention,self).__init__()
+        self.conv1= nn.Conv2d(2, 1, kernel_size, padding=3, bias=False)  # kernel size = 7 Padding is 3: (n - 7 + 1) + 2P = n 
+        self.sigmoid= nn.Sigmoid()
+
+    def forward(self,x):
+        avg_out = torch.mean(x, dim=1, keepdim=True) 
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class CBAM(nn.Module):
+    def __init__(self, channelIn, channelOut):
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttention(channelIn)
+        self.spatial_attention = SpatialAttention()
+
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        # print('outchannels:{}'.format(out.shape))
+        out = self.spatial_attention(out) * out
+        return out
+
+
 class GhostConv(nn.Module):
     # Ghost Convolution https://github.com/huawei-noah/ghostnet
     def __init__(self, c1, c2, k=1, s=1, g=1, act=True):  # ch_in, ch_out, kernel, stride, groups
@@ -318,7 +388,7 @@ class DetectMultiBackend(nn.Module):
         #   TorchScript:                    *.torchscript
         #   ONNX Runtime:                   *.onnx
         #   ONNX OpenCV DNN:                *.onnx --dnn
-        #   OpenVINO:                       *.xml
+        #   OpenVINO:                       *_openvino_model
         #   CoreML:                         *.mlmodel
         #   TensorRT:                       *.engine
         #   TensorFlow SavedModel:          *_saved_model
@@ -462,6 +532,12 @@ class DetectMultiBackend(nn.Module):
             interpreter.allocate_tensors()  # allocate
             input_details = interpreter.get_input_details()  # inputs
             output_details = interpreter.get_output_details()  # outputs
+            # load metadata
+            with contextlib.suppress(zipfile.BadZipFile):
+                with zipfile.ZipFile(w, "r") as model:
+                    meta_file = model.namelist()[0]
+                    meta = ast.literal_eval(model.read(meta_file).decode("utf-8"))
+                    stride, names = int(meta['stride']), meta['names']
         elif tfjs:  # TF.js
             raise NotImplementedError('ERROR: YOLOv5 TF.js inference is not supported')
         elif paddle:  # PaddlePaddle
@@ -469,7 +545,7 @@ class DetectMultiBackend(nn.Module):
             check_requirements('paddlepaddle-gpu' if cuda else 'paddlepaddle')
             import paddle.inference as pdi
             if not Path(w).is_file():  # if not *.pdmodel
-                w = next(Path(w).rglob('*.pdmodel'))  # get *.xml file from *_openvino_model dir
+                w = next(Path(w).rglob('*.pdmodel'))  # get *.pdmodel file from *_paddle_model dir
             weights = Path(w).with_suffix('.pdiparams')
             config = pdi.Config(str(w), str(weights))
             if cuda:
@@ -683,9 +759,9 @@ class AutoShape(nn.Module):
                 s = im.shape[:2]  # HWC
                 shape0.append(s)  # image shape
                 g = max(size) / max(s)  # gain
-                shape1.append([y * g for y in s])
+                shape1.append([int(y * g) for y in s])
                 ims[i] = im if im.data.contiguous else np.ascontiguousarray(im)  # update
-            shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)] if self.pt else size  # inf shape
+            shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)]  # inf shape
             x = [letterbox(im, shape1, auto=False)[0] for im in ims]  # pad
             x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))  # stack and BHWC to BCHW
             x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32

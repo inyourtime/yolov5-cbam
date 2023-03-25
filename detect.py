@@ -29,6 +29,7 @@ import argparse
 import os
 import platform
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -111,6 +112,19 @@ def run(
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
+
+    # Variables to calculate FPS
+    counter, fps = 0, 0
+    start_time = time.time()
+
+    # Visualization parameters
+    row_size = 20  # pixels
+    left_margin = 24  # pixels
+    text_color = (0, 0, 255)  # red
+    font_size = 1
+    font_thickness = 1
+    fps_avg_frame_count = 10
+    
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -174,10 +188,21 @@ def run(
             # Stream results
             im0 = annotator.result()
             if view_img:
+                counter += 1
+                # Calculate the FPS
+                if counter % fps_avg_frame_count == 0:
+                    end_time = time.time()
+                    fps = fps_avg_frame_count / (end_time - start_time)
+                    start_time = time.time()
+
                 if platform.system() == 'Linux' and p not in windows:
                     windows.append(p)
                     cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
                     cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
+                # Show the FPS
+                fps_text = f'FPS = {fps:.1f}'
+                text_location = (left_margin, row_size)
+                cv2.putText(im0, fps_text, text_location, cv2.FONT_HERSHEY_PLAIN, font_size, text_color, font_thickness)
                 cv2.imshow(str(p), im0)
                 cv2.waitKey(1)  # 1 millisecond
 
